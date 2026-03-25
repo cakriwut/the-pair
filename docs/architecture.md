@@ -116,15 +116,7 @@ Agents are not long-running services. Each agent "turn" is a **single CLI proces
 1. **User creates a pair** and provides a task description (spec)
 2. **PairManager** calls `pair_assign_task()`, which prepares the run
 3. **MessageBroker** sets the initial status (`Mentoring`) and activity phases
-4. **ProcessSpawner** builds the CLI command and spawns a child process:
-
-```
-opencode turn \
-  --model <model-id> \
-  --role mentor \
-  --session-id <session-id> \
-  < <task-prompt-via-stdin>
-```
+4. **ProcessSpawner** builds the CLI command via `ProviderAdapter::build_turn_command()` and spawns a child process. The exact command depends on the configured provider (see [Provider-Specific Commands](#provider-specific-commands) below).
 
 5. The spawner attaches async readers to **stdout** and **stderr**
 6. As the agent produces output, the spawner:
@@ -135,11 +127,69 @@ opencode turn \
 
 ### What gets spawned
 
-Each agent turn runs the **opencode CLI** (or another configured provider) as a child process with:
-- **stdin**: The task prompt (plan instructions for the Executor, or review context for the Mentor)
+Each agent turn runs a provider CLI as a child process with:
 - **stdout**: JSON event stream + text output
 - **stderr**: Error logging
 - **Working directory**: The project directory selected for the pair
+
+### Provider-Specific Commands
+
+The Pair supports multiple AI agent providers. Each provider has its own CLI and command structure. The `ProviderAdapter` (in `src-tauri/src/provider_adapter.rs`) builds the correct command for each provider:
+
+#### opencode (default provider)
+
+```
+opencode run \
+  --model <model-id> \
+  --session <session-id> \
+  --format json \
+  "<task-prompt>"
+```
+
+- Uses `run` subcommand with the task prompt as a positional argument
+- `--format json` enables JSON event streaming on stdout
+- `--session` resumes an existing session (omitted on first turn)
+
+#### codex
+
+```
+codex exec [resume <session-id>] \
+  --model <model-id> \
+  [--sandbox read-only] \
+  --json \
+  --output-last-message <temp-file-path> \
+  "<task-prompt>"
+```
+
+- Uses `exec` subcommand; `resume <session-id>` continues an existing session
+- `--sandbox read-only` is applied for the Mentor role to enforce read-only access
+- `--output-last-message` writes the final response to a temp file for reliable extraction
+
+#### claude
+
+```
+claude -p \
+  --model <model-id> \
+  --output-format stream-json \
+  --permission-mode plan|auto \
+  [--resume <session-id>] \
+  "<task-prompt>"
+```
+
+- `-p` enables non-interactive (programmatic) mode
+- `--permission-mode plan` for Mentor (read-only), `auto` for Executor (full access)
+- `--output-format stream-json` enables JSON event streaming
+
+#### gemini
+
+```
+gemini \
+  --model <model-id> \
+  --prompt "<task-prompt>"
+```
+
+- Simplest invocation — model and prompt as flags
+- Uses plain stdio for input/output
 
 ---
 
