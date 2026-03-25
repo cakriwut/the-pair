@@ -233,6 +233,8 @@ Start → Initialize & Baseline → Mentoring Phase → Executing Phase → Revi
                                          (loop back to Mentoring)
 ```
 
+> 📖 **Want the full picture?** See [Agent Architecture — How Mentor & Executor Work](docs/architecture.md) for a deep dive into agent communication, the handoff mechanism, human intervention, and session recovery.
+
 ---
 
 ## Development
