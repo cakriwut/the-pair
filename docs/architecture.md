@@ -10,6 +10,7 @@
 - [Agent Roles](#agent-roles)
 - [System Components](#system-components)
 - [How Agents Are Launched](#how-agents-are-launched)
+- [Walkthrough: Two-Agent Communication Example](#walkthrough-two-agent-communication-example)
 - [Agent Communication Flow](#agent-communication-flow)
 - [The Handoff Mechanism](#the-handoff-mechanism)
 - [Iteration Loop & Task Completion](#iteration-loop--task-completion)
@@ -190,6 +191,162 @@ gemini \
 
 - Simplest invocation — model and prompt as flags
 - Uses plain stdio for input/output
+
+### Walkthrough: Two-Agent Communication Example
+
+Below is a concrete example showing the exact CLI commands The Pair executes behind the scenes. This uses the `opencode` provider, but the same orchestration pattern applies to all providers.
+
+> **Important:** The two agents never call each other directly. The Pair app sits in the middle, capturing one agent's output and passing it as the next agent's input.
+
+#### Setup
+
+Assume a pair is configured with:
+- **Mentor model:** `anthropic/claude-sonnet-4-20250514`
+- **Executor model:** `openai/gpt-4o`
+- **Project directory:** `/home/user/my-project`
+- **Task:** `"Add input validation to the login form"`
+
+All commands below are run from the project directory (`cd /home/user/my-project`).
+
+#### Turn 1 — Mentor plans the task
+
+The Pair spawns the Mentor with a planning prompt:
+
+```bash
+opencode run \
+  --model anthropic/claude-sonnet-4-20250514 \
+  --format json \
+  "ROLE: MENTOR. Analyze the following task and provide a detailed PLAN for the EXECUTOR. \
+DO NOT execute it yourself. DO NOT run commands or edit files. \
+Return ONLY a concrete PLAN with numbered executable steps (no intent-only preface).
+
+TASK: Add input validation to the login form"
+```
+
+The Mentor's JSON output stream is captured. From it, The Pair extracts both:
+- A **session ID** (e.g., `mentor-session-abc123`) — cached for future turns
+- The **text output** — the Mentor's plan:
+
+```
+1. Open src/components/LoginForm.tsx
+2. Add email format validation using a regex pattern
+3. Add password length check (minimum 8 characters)
+4. Display inline error messages below each field
+5. Disable the submit button when validation fails
+6. Add unit tests in src/components/__tests__/LoginForm.test.tsx
+```
+
+#### Turn 2 — Executor implements the plan
+
+The Pair wraps the Mentor's output in an Executor prompt and spawns a new process:
+
+```bash
+opencode run \
+  --model openai/gpt-4o \
+  --format json \
+  "### ROLE: EXECUTOR
+Your mission is ONLY to EXECUTE the plan provided below.
+- DO NOT create new plans.
+- DO NOT review your own work.
+- JUST EXECUTE THE STEPS and report results.
+
+--- COMMAND TO EXECUTE ---
+1. Open src/components/LoginForm.tsx
+2. Add email format validation using a regex pattern
+3. Add password length check (minimum 8 characters)
+4. Display inline error messages below each field
+5. Disable the submit button when validation fails
+6. Add unit tests in src/components/__tests__/LoginForm.test.tsx"
+```
+
+The Executor runs with full file-system access. It edits files, runs tests, and produces a result. The Pair captures a **session ID** (e.g., `executor-session-xyz789`) and the **text output**:
+
+```
+Completed all steps:
+- Added email regex validation to LoginForm.tsx
+- Added password length check (min 8 chars)
+- Added inline error messages with red text
+- Submit button disabled when errors exist
+- Created LoginForm.test.tsx with 4 test cases
+- All tests passing
+```
+
+#### Turn 3 — Mentor reviews the results
+
+The Pair wraps the Executor's output in a review prompt and spawns the Mentor again, resuming its session:
+
+```bash
+opencode run \
+  --model anthropic/claude-sonnet-4-20250514 \
+  --session mentor-session-abc123 \
+  --format json \
+  "### ROLE: MENTOR
+Your mission is ONLY to PLAN and REVIEW.
+- DO NOT execute any code or tools that modify files.
+- YOUR GOAL: Provide a clear, actionable plan for the EXECUTOR.
+
+--- REVIEW REQUEST ---
+The executor has finished a turn. Review their results below:
+
+Completed all steps:
+- Added email regex validation to LoginForm.tsx
+- Added password length check (min 8 chars)
+- Added inline error messages with red text
+- Submit button disabled when errors exist
+- Created LoginForm.test.tsx with 4 test cases
+- All tests passing
+
+If the mission is complete and all requirements are satisfied, include the exact token \"TASK_COMPLETE\" in your final output. Otherwise, provide a refined PLAN for the next iteration."
+```
+
+The Mentor reviews and either:
+
+**Case A — Task is complete:**
+```
+All validation requirements are implemented and tests are passing.
+
+TASK_COMPLETE
+```
+→ The Pair detects the `TASK_COMPLETE` token and sets the pair status to **Finished**.
+
+**Case B — More work needed:**
+```
+Good progress, but missing edge cases:
+1. Add validation for empty fields (not just format)
+2. Add rate limiting feedback after 3 failed attempts
+3. The regex allows "user@" without a domain — fix the pattern
+```
+→ The Pair wraps this in another Executor prompt (like Turn 2) and the loop continues.
+
+#### Sequence diagram
+
+```
+  Human          The Pair App         Mentor CLI          Executor CLI
+    │                 │                   │                     │
+    │  Assign task    │                   │                     │
+    │────────────────▶│                   │                     │
+    │                 │  opencode run     │                     │
+    │                 │  (planning prompt)│                     │
+    │                 │──────────────────▶│                     │
+    │                 │   Plan output     │                     │
+    │                 │◀─────────────────│                     │
+    │                 │                   │                     │
+    │                 │  opencode run                           │
+    │                 │  (executor prompt with plan)            │
+    │                 │───────────────────────────────────────▶│
+    │                 │                    Result output        │
+    │                 │◀──────────────────────────────────────│
+    │                 │                   │                     │
+    │                 │  opencode run     │                     │
+    │                 │  (review prompt)  │                     │
+    │                 │──────────────────▶│                     │
+    │                 │  TASK_COMPLETE    │                     │
+    │                 │◀─────────────────│                     │
+    │  Task finished  │                   │                     │
+    │◀────────────────│                   │                     │
+```
+
+> **Reference:** The prompt templates are built in the frontend (`src/renderer/src/store/usePairStore.ts`, lines ~910-963) and the initial mentor prompt is built in the backend (`src-tauri/src/pair_manager.rs`, `build_mentor_planning_prompt()`). The CLI commands are constructed by `ProviderAdapter::build_turn_command()` in `src-tauri/src/provider_adapter.rs`.
 
 ---
 
